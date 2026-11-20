@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
   Saves and restores the size and position of all open windows on Windows 10/11.
-  Uses only built-in Windows APIs (user32.dll / dwmapi.dll) - no third-party software.
+  Uses only built-in Windows APIs (user32.dll / dwmapi.dll / shcore.dll) -
+  no third-party software.
 
 .DESCRIPTION
   Save   : records the position/size/title/process/maximized-state of every
@@ -14,6 +15,15 @@
   Matching is by TITLE because window handles (HWND) change between sessions,
   so apps without unique titles may not be matched. Restored coordinates are
   clamped to the current virtual desktop area so nothing lands off-screen.
+
+  DPI AWARENESS
+  The script declares itself per-monitor-DPI-aware (v2) at startup, so all
+  coordinates are TRUE PHYSICAL PIXELS with no DPI virtualization in between.
+  A layout saved and restored with this same script is therefore pixel-exact
+  on mixed-DPI multi-monitor systems. Note: coordinates are physical, so if
+  you change scaling between save and restore (e.g. 100% -> 150%), windows
+  return to the same physical spot but occupy relatively more/less of the
+  logical desktop - usually what you want, but worth knowing.
 
 .USAGE
   Save layout:
@@ -29,6 +39,13 @@
   Ctrl+Alt+R) in each shortcut's Properties for one-keystroke save/restore.
 
 .CHANGELOG
+  1.3  Fixed: parse error at startup ("Missing expression after '='") caused by
+       using a cmdlet call (Join-Path) as a parameter DEFAULT VALUE, which
+       PowerShell does not allow - defaults must be constant expressions.
+       Replaced with an expandable string literal.
+  1.2  Added: per-monitor DPI awareness (v2) declared at startup so save and
+       restore operate on physical pixels - removes the few-pixels-off drift
+       on mixed-DPI multi-monitor setups.
   1.1  Fixed: crash when several windows shared a title (invalid
        'Select-Object -Object' parameter); uninitialized $usedHandles array;
        desktop/shell windows (Progman/WorkerW/SHELLDLL_DefView) being captured;
@@ -42,8 +59,6 @@
      does not relaunch apps.
    - Apps that manage their own window placement (some Electron/UWP apps)
      may fight back and reposition themselves.
-   - With mixed-DPI multi-monitor setups, saved coordinates can be slightly
-     off on restore because of DPI virtualization.
    - Minimized windows are not saved (Windows hides their real position).
    - Requires PowerShell run at the same integrity level as the target windows
      (a normal, non-elevated session handles your normal windows fine).
@@ -54,7 +69,10 @@ param(
     [ValidateSet('Save', 'Restore')]
     [string]$Action,
 
-    [string]$Path = Join-Path $env:USERPROFILE 'window-layout.json'
+    # NOTE: parameter default values must be CONSTANT EXPRESSIONS. A cmdlet
+    # call like 'Join-Path ...' is a parse error here; an expandable string
+    # is evaluated at runtime and is legal.
+    [string]$Path = "$env:USERPROFILE\window-layout.json"
 )
 
 $ErrorActionPreference = 'Stop'
@@ -117,6 +135,42 @@ namespace WinLayout
         [DllImport("dwmapi.dll")]
         private static extern int  DwmGetWindowAttribute(IntPtr h, int attr,
             out int value, int size);
+
+        // ---- DPI awareness -------------------------------------------------
+        // Per-Monitor-V2 keeps GetWindowRect/SetWindowPos in true physical
+        // pixels on every monitor. Older fallbacks cover older Windows.
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+        [DllImport("shcore.dll")]
+        private static extern int  SetProcessDpiAwareness(int value);
+        [DllImport("user32.dll")]
+        private static extern bool SetProcessDPIAware();
+
+        private static readonly IntPtr DPI_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
+        private const int PROCESS_PER_MONITOR_DPI_AWARE = 2;
+
+        public static string EnsureDpiAwareness()
+        {
+            // Best: per-monitor v2 (Windows 10 1703+).
+            try
+            {
+                if (SetProcessDpiAwarenessContext(DPI_PER_MONITOR_AWARE_V2))
+                    return "PerMonitorV2";
+            }
+            catch (EntryPointNotFoundException) { /* pre-1703 */ }
+
+            // Second best: per-monitor v1.
+            try
+            {
+                if (SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE) == 0)
+                    return "PerMonitorV1";
+            }
+            catch (EntryPointNotFoundException) { /* pre-Win8.1 */ }
+
+            // Last resort: system-DPI aware (exact on single-DPI systems).
+            if (SetProcessDPIAware()) return "System";
+            return "None";
+        }
 
         private const int GWL_EXSTYLE       = -20;
         private const int WS_EX_TOOLWINDOW  = 0x00000080;
@@ -211,6 +265,10 @@ namespace WinLayout
 '@
 }
 
+# Declare DPI awareness FIRST, before any window enumeration, so every
+# coordinate below is in physical pixels.
+$script:DpiMode = [WinLayout.Helper]::EnsureDpiAwareness()
+
 # Build a single PID -> process-name lookup so we never call Get-Process in a
 # loop (the old version did this per comparison, O(n^2)).
 function Get-ProcessNameLookup {
@@ -247,7 +305,7 @@ switch ($Action) {
         }
 
         $entries | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $Path -Encoding Unicode
-        Write-Host ("Saved {0} window(s) to '{1}'." -f @($entries).Count, $Path)
+        Write-Host ("Saved {0} window(s) to '{1}' (DPI mode: {2})." -f @($entries).Count, $Path, $script:DpiMode)
     }
 
     # ---------------------------------------------------------- RESTORE
@@ -282,7 +340,7 @@ switch ($Action) {
 
             $match = $candidates |
                 Where-Object { $usedHandles -notcontains $_.Handle } |
-                Select-Object -First 1        # <-- was: Select-Object -Object -First 1 (crashed)
+                Select-Object -First 1
 
             if (-not $match) {
                 $missed.Add(('{0} - "{1}"' -f $s.Process, $s.Title))
@@ -303,7 +361,7 @@ switch ($Action) {
             }
         }
 
-        Write-Host ("Restored {0} of {1} window(s)." -f $restored, $saved.Count)
+        Write-Host ("Restored {0} of {1} window(s) (DPI mode: {2})." -f $restored, $saved.Count, $script:DpiMode)
         if ($missed.Count -gt 0) {
             Write-Host 'Not restored (not open, or no matching title):'
             $missed | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" }
