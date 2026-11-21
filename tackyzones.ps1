@@ -315,7 +315,11 @@ switch ($Action) {
             return
         }
 
-        $saved    = @(Get-Content -LiteralPath $Path -Raw -Encoding Unicode | ConvertFrom-Json)
+        $parsed = Get-Content -LiteralPath $Path -Raw -Encoding Unicode | ConvertFrom-Json
+        # In PowerShell 5.1, ConvertFrom-Json hands back a top-level JSON
+        # array as a SINGLE object, so @(...) wraps it as one element.
+        # Unwrap it explicitly (works identically on PS 5.1 and 7.x).
+        $saved = if ($parsed -is [array]) { $parsed } else { @($parsed) }
         $current  = [WinLayout.Helper]::Capture()
         $procName = Get-ProcessNameLookup
 
