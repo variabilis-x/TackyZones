@@ -17,13 +17,21 @@
   clamped to the current virtual desktop area so nothing lands off-screen.
 
   DPI AWARENESS
-  The script declares itself per-monitor-DPI-aware (v2) at startup, so all
-  coordinates are TRUE PHYSICAL PIXELS with no DPI virtualization in between.
+  The script declares per-monitor-DPI-aware (v2) both at the process level
+  (best effort, in case the host has not already locked a context) and at the
+  THREAD level around every coordinate-sensitive operation (Capture and
+  Place). The thread-level switch works even when the host has already fixed
+  the process-level context, so all coordinates are TRUE PHYSICAL PIXELS on
+  every Windows 10 1607+ system - eliminating the few-pixels-off drift caused
+  by DPI virtualization rounding on systems with >100% display scaling.
   A layout saved and restored with this same script is therefore pixel-exact
   on mixed-DPI multi-monitor systems. Note: coordinates are physical, so if
   you change scaling between save and restore (e.g. 100% -> 150%), windows
   return to the same physical spot but occupy relatively more/less of the
   logical desktop - usually what you want, but worth knowing.
+  IMPORTANT: after upgrading from an older version, RE-SAVE your layout once
+  before restoring; layouts saved by older versions contain rounded
+  (virtualized) coordinates.
 
 .USAGE
   Save layout:
@@ -39,6 +47,23 @@
   Ctrl+Alt+R) in each shortcut's Properties for one-keystroke save/restore.
 
 .CHANGELOG
+  1.5  Fixed: restore landing windows a few pixels off from the saved
+       position. Cause: when the process-level per-monitor DPI declaration
+       fails (common, because the hosting console usually locks the context
+       first), the script fell back to system-DPI-aware mode and all
+       GetWindowRect/SetWindowPos calls went through DPI virtualization with
+       its rounding on both directions. Fix: the Capture and Place methods
+       now switch the CALLING THREAD to per-monitor-v2 DPI awareness via
+       SetThreadDpiAwarenessContext (Windows 10 1607+) for the duration of
+       the call and restore the previous context afterwards, guaranteeing
+       true physical-pixel coordinates regardless of the process context.
+       The reported "DPI mode" is now informational only.
+  1.4  Fixed: restore reported "Restored 0 of N" with System.Object[] names
+       under Windows PowerShell 5.1. Cause: in 5.1 ConvertFrom-Json emits a
+       top-level JSON array as a SINGLE object, so the @( ) wrapper produced
+       a one-element array containing the whole collection and every entry
+       was "the array", never matching a real window. Fix: the parsed result
+       is now unwrapped explicitly (identical behavior on 5.1 and 7.x).
   1.3  Fixed: parse error at startup ("Missing expression after '='") caused by
        using a cmdlet call (Join-Path) as a parameter DEFAULT VALUE, which
        PowerShell does not allow - defaults must be constant expressions.
@@ -137,14 +162,21 @@ namespace WinLayout
             out int value, int size);
 
         // ---- DPI awareness -------------------------------------------------
-        // Per-Monitor-V2 keeps GetWindowRect/SetWindowPos in true physical
-        // pixels on every monitor. Older fallbacks cover older Windows.
+        // Best effort at process level (only succeeds if the host has not
+        // already locked a context). Correctness no longer depends on it:
+        // Capture() and Place() switch the THREAD context instead.
         [DllImport("user32.dll")]
         private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
         [DllImport("shcore.dll")]
         private static extern int  SetProcessDpiAwareness(int value);
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
+
+        // Thread-level context switching (Windows 10 1607+). Works even when
+        // the process-level context is locked, which is common with console
+        // hosts. Affects GetWindowRect / SetWindowPos on the calling thread.
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr value);
 
         private static readonly IntPtr DPI_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
         private const int PROCESS_PER_MONITOR_DPI_AWARE = 2;
@@ -170,6 +202,29 @@ namespace WinLayout
             // Last resort: system-DPI aware (exact on single-DPI systems).
             if (SetProcessDPIAware()) return "System";
             return "None";
+        }
+
+        // Enter per-monitor-v2 on the calling thread for the duration of a
+        // coordinate-sensitive operation, restoring the previous context
+        // afterwards. Returns the previous context, or IntPtr.Zero if the
+        // API is unavailable (pre-1607 systems).
+        public static IntPtr EnterThreadDpiAwareness()
+        {
+            try
+            {
+                IntPtr old = SetThreadDpiAwarenessContext(DPI_PER_MONITOR_AWARE_V2);
+                return old; // IntPtr.Zero => API missing, caller must not restore
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return IntPtr.Zero;
+            }
+        }
+
+        public static void ExitThreadDpiAwareness(IntPtr previous)
+        {
+            if (previous != IntPtr.Zero)
+                SetThreadDpiAwarenessContext(previous);
         }
 
         private const int GWL_EXSTYLE       = -20;
@@ -229,29 +284,48 @@ namespace WinLayout
 
         public static WinInfo[] Capture()
         {
-            _windows = new List<WinInfo>();
-            EnumWindows(Callback, IntPtr.Zero);
-            return _windows.ToArray();
+            // Thread-level per-monitor-v2 context => GetWindowRect inside the
+            // callback returns true physical pixels even when the process
+            // context could not be upgraded (avoids DPI-virtualization drift).
+            IntPtr oldCtx = EnterThreadDpiAwareness();
+            try
+            {
+                _windows = new List<WinInfo>();
+                EnumWindows(Callback, IntPtr.Zero);
+                return _windows.ToArray();
+            }
+            finally
+            {
+                ExitThreadDpiAwareness(oldCtx);
+            }
         }
 
         // Move a window to the given rectangle, clamped to the visible virtual
         // desktop so a saved position never ends up off-screen.
         public static bool Place(IntPtr h, int left, int top, int right, int bottom)
         {
-            int vsX = GetSystemMetrics(76);   // SM_XVIRTUALSCREEN
-            int vsY = GetSystemMetrics(77);   // SM_YVIRTUALSCREEN
-            int vsW = GetSystemMetrics(78);   // SM_CXVIRTUALSCREEN
-            int vsH = GetSystemMetrics(79);   // SM_CYVIRTUALSCREEN
+            IntPtr oldCtx = EnterThreadDpiAwareness();
+            try
+            {
+                int vsX = GetSystemMetrics(76);   // SM_XVIRTUALSCREEN
+                int vsY = GetSystemMetrics(77);   // SM_YVIRTUALSCREEN
+                int vsW = GetSystemMetrics(78);   // SM_CXVIRTUALSCREEN
+                int vsH = GetSystemMetrics(79);   // SM_CYVIRTUALSCREEN
 
-            if (right - left > vsW) { right  = left + vsW; }
-            if (bottom - top > vsH) { bottom = top + vsH; }
-            if (left < vsX)       { right  += vsX - left;  left  = vsX; }
-            if (top  < vsY)       { bottom += vsY - top;   top   = vsY; }
-            if (right > vsX + vsW) { left   -= right - (vsX + vsW); right  = vsX + vsW; }
-            if (bottom > vsY + vsH){ top    -= bottom - (vsY + vsH); bottom = vsY + vsH; }
+                if (right - left > vsW) { right  = left + vsW; }
+                if (bottom - top > vsH) { bottom = top + vsH; }
+                if (left < vsX)       { right  += vsX - left;  left  = vsX; }
+                if (top  < vsY)       { bottom += vsY - top;   top   = vsY; }
+                if (right > vsX + vsW) { left   -= right - (vsX + vsW); right  = vsX + vsW; }
+                if (bottom > vsY + vsH){ top    -= bottom - (vsY + vsH); bottom = vsY + vsH; }
 
-            return SetWindowPos(h, IntPtr.Zero, left, top,
-                right - left, bottom - top, SWP_NOZORDER | SWP_NOACTIVATE);
+                return SetWindowPos(h, IntPtr.Zero, left, top,
+                    right - left, bottom - top, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            finally
+            {
+                ExitThreadDpiAwareness(oldCtx);
+            }
         }
 
         // Re-maximize a window after it has been placed (async so a hung
@@ -266,7 +340,8 @@ namespace WinLayout
 }
 
 # Declare DPI awareness FIRST, before any window enumeration, so every
-# coordinate below is in physical pixels.
+# coordinate below is in physical pixels. Best effort only: the thread-level
+# switch inside Capture/Place guarantees correctness even if this falls back.
 $script:DpiMode = [WinLayout.Helper]::EnsureDpiAwareness()
 
 # Build a single PID -> process-name lookup so we never call Get-Process in a
@@ -316,10 +391,13 @@ switch ($Action) {
         }
 
         $parsed = Get-Content -LiteralPath $Path -Raw -Encoding Unicode | ConvertFrom-Json
-        # In PowerShell 5.1, ConvertFrom-Json hands back a top-level JSON
-        # array as a SINGLE object, so @(...) wraps it as one element.
-        # Unwrap it explicitly (works identically on PS 5.1 and 7.x).
-        $saved = if ($parsed -is [array]) { $parsed } else { @($parsed) }
+
+        # Windows PowerShell 5.1 emits a top-level JSON array as a SINGLE
+        # object, so wrapping it in @(...) yields a one-element array whose
+        # only element is the whole collection (PS 7.x enumerates by default).
+        # Unwrap explicitly so both versions behave identically.
+        if ($parsed -is [array]) { $saved = $parsed } else { $saved = @($parsed) }
+
         $current  = [WinLayout.Helper]::Capture()
         $procName = Get-ProcessNameLookup
 
@@ -365,11 +443,10 @@ switch ($Action) {
             }
         }
 
-        Write-Host ("Restored {0} of {1} window(s) (DPI mode: {2})." -f $restored, $saved.Count, $script:DpiMode)
+        Write-Host ("Restored {0} of {1} window(s) (DPI mode: {2})." -f $restored, @($saved).Count, $script:DpiMode)
         if ($missed.Count -gt 0) {
             Write-Host 'Not restored (not open, or no matching title):'
             $missed | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" }
         }
     }
 }
-

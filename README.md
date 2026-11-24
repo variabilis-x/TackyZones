@@ -93,6 +93,7 @@ The JSON file is human-readable and editable:
 ]
 ```
 
+<<<<<<< HEAD
 ## Changelog
 
 - **1.4** — Fixed restore under Windows PowerShell 5.1: top-level JSON array from `ConvertFrom-Json` is now unwrapped explicitly instead of relying on `@()` enumeration, which fails on 5.1.
@@ -100,6 +101,8 @@ The JSON file is human-readable and editable:
 - **1.2** — Added per-monitor DPI awareness (v2) so save and restore operate on physical pixels; removes drift on mixed-DPI multi-monitor setups.
 - **1.1** — Fixed crashes on duplicate titles, uninitialized handle tracking, desktop/shell windows being captured, pseudo-maximized restores, and repeated `Add-Type` failures; replaced O(n²) process lookups with a single lookup table.
 
+=======
+>>>>>>> b98fe01 (Various bug fixes.)
 ## License
 
 Provided as-is, free to use and modify.
