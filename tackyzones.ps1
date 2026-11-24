@@ -16,21 +16,33 @@
   so apps without unique titles may not be matched. Restored coordinates are
   clamped to the current virtual desktop area so nothing lands off-screen.
 
+  PLACEMENT CORRECTION (convergence loop)
+  On mixed-DPI systems (e.g. laptop panel at 150% + external monitor at
+  100% via a dock), Windows converts coordinates between per-monitor spaces
+  for windows whose DPI awareness does not match the monitor scaling. That
+  conversion involves rounding, so a single SetWindowPos call can land a
+  window a few pixels off the requested rectangle - deterministically, the
+  same few pixels every time. Place() therefore closes the loop: it places
+  the window, measures where it actually landed with GetWindowRect, adjusts
+  the target by the observed error, and retries - up to four iterations or
+  until the measured rectangle matches the target exactly. This converges
+  on pixel-exact placement regardless of which conversion layer rounds.
+
+  SNAP INTERFERENCE GUARD
+  Windows 11's snap machinery (and some apps) can also re-adjust a window
+  asynchronously AFTER SetWindowPos reports success. Restore therefore
+  verifies every placed non-maximized window ~350 ms later and re-places
+  any that moved, up to three rounds.
+
   DPI AWARENESS
   The script declares per-monitor-DPI-aware (v2) both at the process level
-  (best effort, in case the host has not already locked a context) and at the
-  THREAD level around every coordinate-sensitive operation (Capture and
-  Place). The thread-level switch works even when the host has already fixed
-  the process-level context, so all coordinates are TRUE PHYSICAL PIXELS on
-  every Windows 10 1607+ system - eliminating the few-pixels-off drift caused
-  by DPI virtualization rounding on systems with >100% display scaling.
-  A layout saved and restored with this same script is therefore pixel-exact
-  on mixed-DPI multi-monitor systems. Note: coordinates are physical, so if
-  you change scaling between save and restore (e.g. 100% -> 150%), windows
-  return to the same physical spot but occupy relatively more/less of the
-  logical desktop - usually what you want, but worth knowing.
+  (best effort) and at the THREAD level around every coordinate-sensitive
+  operation (Capture, Place, and the convergence measurements inside
+  Place), so all coordinates are TRUE PHYSICAL PIXELS on every
+  Windows 10 1607+ system - including when the hosting console has already
+  locked the process-level context.
   IMPORTANT: after upgrading from an older version, RE-SAVE your layout once
-  before restoring; layouts saved by older versions contain rounded
+  before restoring; layouts saved by older versions may contain rounded
   (virtualized) coordinates.
 
 .USAGE
@@ -47,6 +59,18 @@
   Ctrl+Alt+R) in each shortcut's Properties for one-keystroke save/restore.
 
 .CHANGELOG
+  1.7  Fixed: deterministic few-pixel offset on restore, unaffected by
+       disabling Windows snap and identical on repeated restores. Cause:
+       on mixed-DPI systems, coordinate conversion between per-monitor
+       spaces (for windows whose DPI awareness differs from the monitor
+       scaling) rounds coordinates in both directions, so a single
+       SetWindowPos lands the same few pixels off every time. Fix: Place()
+       now converges - place, measure with GetWindowRect, adjust the target
+       by the observed error, retry (max 4 iterations, stop when exact).
+  1.6  Added: post-placement verification. Windows 11's snap machinery and
+       some apps re-adjust windows asynchronously after SetWindowPos reports
+       success; Restore re-measures placed windows ~350 ms later and
+       re-asserts any that moved (up to three rounds), reporting the count.
   1.5  Fixed: restore landing windows a few pixels off from the saved
        position. Cause: when the process-level per-monitor DPI declaration
        fails (common, because the hosting console usually locks the context
@@ -55,35 +79,28 @@
        its rounding on both directions. Fix: the Capture and Place methods
        now switch the CALLING THREAD to per-monitor-v2 DPI awareness via
        SetThreadDpiAwarenessContext (Windows 10 1607+) for the duration of
-       the call and restore the previous context afterwards, guaranteeing
-       true physical-pixel coordinates regardless of the process context.
-       The reported "DPI mode" is now informational only.
+       the call and restore the previous context afterwards.
   1.4  Fixed: restore reported "Restored 0 of N" with System.Object[] names
-       under Windows PowerShell 5.1. Cause: in 5.1 ConvertFrom-Json emits a
-       top-level JSON array as a SINGLE object, so the @( ) wrapper produced
-       a one-element array containing the whole collection and every entry
-       was "the array", never matching a real window. Fix: the parsed result
-       is now unwrapped explicitly (identical behavior on 5.1 and 7.x).
-  1.3  Fixed: parse error at startup ("Missing expression after '='") caused by
-       using a cmdlet call (Join-Path) as a parameter DEFAULT VALUE, which
-       PowerShell does not allow - defaults must be constant expressions.
-       Replaced with an expandable string literal.
-  1.2  Added: per-monitor DPI awareness (v2) declared at startup so save and
-       restore operate on physical pixels - removes the few-pixels-off drift
-       on mixed-DPI multi-monitor setups.
-  1.1  Fixed: crash when several windows shared a title (invalid
-       'Select-Object -Object' parameter); uninitialized $usedHandles array;
-       desktop/shell windows (Progman/WorkerW/SHELLDLL_DefView) being captured;
-       maximized windows restored as pseudo-maximized normal windows;
-       Add-Type failing when the script ran twice in one session;
-       O(n^2) Get-Process calls replaced with a single lookup table.
+       under Windows PowerShell 5.1 (ConvertFrom-Json top-level array
+       emitted as a single object). Fix: parsed result is unwrapped
+       explicitly (identical behavior on 5.1 and 7.x).
+  1.3  Fixed: parse error at startup caused by using a cmdlet call as a
+       parameter default value; defaults must be constant expressions.
+  1.2  Added: per-monitor DPI awareness (v2) declared at startup.
+  1.1  Fixed: crash when several windows shared a title; uninitialized
+       $usedHandles array; desktop/shell windows being captured; maximized
+       windows restored as pseudo-maximized normal windows; Add-Type failing
+       when the script ran twice in one session; O(n^2) Get-Process calls
+       replaced with a single lookup table.
 
 .NOTES
   Limitations (inherent to Windows, not the script):
    - The app must be OPEN when you restore; this moves existing windows, it
      does not relaunch apps.
    - Apps that manage their own window placement (some Electron/UWP apps)
-     may fight back and reposition themselves.
+     may fight back and reposition themselves. The verification pass
+     re-asserts the saved position, but a badly behaved app can win a
+     tug-of-war over the long run.
    - Minimized windows are not saved (Windows hides their real position).
    - Requires PowerShell run at the same integrity level as the target windows
      (a normal, non-elevated session handles your normal windows fine).
@@ -163,7 +180,7 @@ namespace WinLayout
 
         // ---- DPI awareness -------------------------------------------------
         // Best effort at process level (only succeeds if the host has not
-        // already locked a context). Correctness no longer depends on it:
+        // already locked a context). Correctness does not depend on it:
         // Capture() and Place() switch the THREAD context instead.
         [DllImport("user32.dll")]
         private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
@@ -302,6 +319,14 @@ namespace WinLayout
 
         // Move a window to the given rectangle, clamped to the visible virtual
         // desktop so a saved position never ends up off-screen.
+        //
+        // CONVERGENCE LOOP: on mixed-DPI systems the coordinate conversion
+        // between per-monitor spaces (for windows whose DPI awareness differs
+        // from the monitor scaling) rounds coordinates in both directions, so
+        // a single SetWindowPos can land the same few pixels off every time.
+        // We therefore place, measure the actual result with GetWindowRect,
+        // adjust the target by the observed error and retry - up to four
+        // iterations, stopping as soon as the measured rectangle matches.
         public static bool Place(IntPtr h, int left, int top, int right, int bottom)
         {
             IntPtr oldCtx = EnterThreadDpiAwareness();
@@ -319,8 +344,32 @@ namespace WinLayout
                 if (right > vsX + vsW) { left   -= right - (vsX + vsW); right  = vsX + vsW; }
                 if (bottom > vsY + vsH){ top    -= bottom - (vsY + vsH); bottom = vsY + vsH; }
 
-                return SetWindowPos(h, IntPtr.Zero, left, top,
-                    right - left, bottom - top, SWP_NOZORDER | SWP_NOACTIVATE);
+                // Retry loop: place, measure, correct, repeat.
+                for (int attempt = 0; attempt < 4; attempt++)
+                {
+                    if (!SetWindowPos(h, IntPtr.Zero, left, top,
+                        right - left, bottom - top, SWP_NOZORDER | SWP_NOACTIVATE))
+                        return false;
+
+                    RECT r;
+                    if (!GetWindowRect(h, out r))
+                        return true;               // placed, but cannot verify
+
+                    int dx = left       - r.L;     // position error (target - actual)
+                    int dy = top        - r.T;
+                    int dw = (right - left)  - (r.R - r.L);   // size error
+                    int dh = (bottom - top)  - (r.B - r.T);
+
+                    if (dx == 0 && dy == 0 && dw == 0 && dh == 0)
+                        return true;               // pixel-exact; done
+
+                    // Fold the observed error into the next attempt's target.
+                    left   += dx;
+                    top    += dy;
+                    right  += dx + dw;
+                    bottom += dy + dh;
+                }
+                return true;                       // closest achievable
             }
             finally
             {
@@ -405,6 +454,10 @@ switch ($Action) {
         # same-titled windows each get their own position (in saved order).
         $usedHandles = @()
 
+        # Track every successful placement (handle -> saved entry) so the
+        # verification pass below can re-check them.
+        $placements = @{}
+
         $restored = 0
         $missed   = New-Object System.Collections.Generic.List[string]
 
@@ -436,6 +489,7 @@ switch ($Action) {
             if ($placed) {
                 $usedHandles += $match.Handle
                 if ($s.Maximized) { [void][WinLayout.Helper]::Maximize($match.Handle) }
+                $placements[$match.Handle] = $s
                 $restored++
             }
             else {
@@ -443,7 +497,62 @@ switch ($Action) {
             }
         }
 
-        Write-Host ("Restored {0} of {1} window(s) (DPI mode: {2})." -f $restored, @($saved).Count, $script:DpiMode)
+        # ------------------------------------------- VERIFICATION PASS
+        # Windows 11's snap machinery (and some apps) can re-adjust a window
+        # a moment AFTER SetWindowPos has reported success. Re-measure every
+        # placed window ~350 ms later and put back any that moved; repeat up
+        # to three rounds until everything sticks. Maximized windows are
+        # skipped: their on-screen rectangle is owned by the maximize state.
+        $reasserted = 0
+
+        $toVerify = @{}
+        foreach ($kv in $placements.GetEnumerator()) {
+            if (-not $kv.Value.Maximized) { $toVerify[$kv.Key] = $kv.Value }
+        }
+
+        if ($toVerify.Count -gt 0) {
+            for ($round = 1; $round -le 3; $round++) {
+                Start-Sleep -Milliseconds 350
+                $live    = [WinLayout.Helper]::Capture()
+                $movedAny = $false
+
+                foreach ($kv in $toVerify.GetEnumerator()) {
+                    $h = $kv.Key
+                    $s = $kv.Value
+
+                    $w = $live | Where-Object { $_.Handle -eq $h } |
+                        Select-Object -First 1
+                    if (-not $w) { continue }   # window closed/minimized since
+
+                    $offX = $w.Left - [int]$s.Left
+                    $offY = $w.Top  - [int]$s.Top
+                    $offW = ($w.Right  - $w.Left)   - [int]$s.Width
+                    $offH = ($w.Bottom - $w.Top)    - [int]$s.Height
+
+                    if ($offX -ne 0 -or $offY -ne 0 -or $offW -ne 0 -or $offH -ne 0) {
+                        # The window wandered after placement - snap state or
+                        # the app corrected it. Put it back (Place converges).
+                        [void][WinLayout.Helper]::Place($h,
+                            [int]$s.Left, [int]$s.Top,
+                            ([int]$s.Left + [int]$s.Width),
+                            ([int]$s.Top  + [int]$s.Height))
+                        $movedAny  = $true
+                        $reasserted++
+                    }
+                }
+
+                if (-not $movedAny) { break }   # everything stuck; done early
+            }
+        }
+        # -------------------------------------------------------------- end
+
+        $summary = ("Restored {0} of {1} window(s) (DPI mode: {2})." -f
+            $restored, @($saved).Count, $script:DpiMode)
+        if ($reasserted -gt 0) {
+            $summary += " Re-asserted {0} placement(s) that Windows or the app adjusted afterwards." -f $reasserted
+        }
+        Write-Host $summary
+
         if ($missed.Count -gt 0) {
             Write-Host 'Not restored (not open, or no matching title):'
             $missed | Sort-Object -Unique | ForEach-Object { Write-Host "  - $_" }
