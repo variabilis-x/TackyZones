@@ -5,45 +5,65 @@
   no third-party software.
 
 .DESCRIPTION
-  Save   : records the position/size/title/process/maximized-state of every
-           visible top-level window to a JSON file
+  Save   : records the position/size/title/process/class/maximized-state of
+           every visible top-level window to a JSON file
            (default: %USERPROFILE%\window-layout.json).
   Restore: re-enumerates currently open windows, matches them to the saved
-           entries by window title (+ process as a sanity check), and moves
-           them back to their saved rectangles, re-maximizing where needed.
+           entries, and moves them back to their saved rectangles,
+           re-maximizing where needed.
 
-  Matching is by TITLE because window handles (HWND) change between sessions,
-  so apps without unique titles may not be matched. Restored coordinates are
-  clamped to the current virtual desktop area so nothing lands off-screen.
+  MATCHING CASCADE
+  Window handles (HWND) change between sessions, and for some apps the
+  TITLE changes too (Edge shows the active tab, Teams the active
+  conversation). Restore therefore matches through a cascade:
+    1. exact title + process + window class   (precise, titles unchanged)
+    2. process + window class                 (title went stale - tab or
+                                               conversation changed since save)
+    3. title + process                        (legacy layouts saved before
+                                               window classes were recorded)
+  Window class names are stable across sessions and do not depend on the
+  active tab. For apps with several windows of the same class, cascade 2
+  assigns them in saved/enumeration order, which may pair two windows of
+  the same app to each other's positions; both still land at a saved
+  rectangle.
+
+  EDGE-FLUSH WINDOWS AND THE INVISIBLE BORDER
+  Every Windows 10/11 top-level window carries an invisible resize border
+  (~7-8 physical pixels) that GetWindowRect includes in its rectangle.
+  Windows that are snapped flush against a screen edge have their VISIBLE
+  edge at the monitor edge, so their OUTER rectangle legitimately extends
+  PAST the monitor edge by the border width. This is normal, intentional
+  geometry - not a window that is lost off-screen. Place() therefore
+  tolerates a small overhang (16 physical pixels per side) when clamping
+  to the virtual desktop: only windows that are genuinely, substantially
+  outside the visible desktop are pulled back on-screen. Earlier versions
+  clamped at the exact monitor edge, which dragged edge-flush windows
+  inward by the border width on every restore while leaving in-between
+  windows untouched.
 
   PLACEMENT CORRECTION (convergence loop)
   On mixed-DPI systems (e.g. laptop panel at 150% + external monitor at
-  100% via a dock), Windows converts coordinates between per-monitor spaces
-  for windows whose DPI awareness does not match the monitor scaling. That
-  conversion involves rounding, so a single SetWindowPos call can land a
-  window a few pixels off the requested rectangle - deterministically, the
-  same few pixels every time. Place() therefore closes the loop: it places
-  the window, measures where it actually landed with GetWindowRect, adjusts
-  the target by the observed error, and retries - up to four iterations or
-  until the measured rectangle matches the target exactly. This converges
-  on pixel-exact placement regardless of which conversion layer rounds.
+  100% via a dock), coordinate conversion between per-monitor spaces can
+  round coordinates, so a single SetWindowPos call may land a window a
+  pixel or two off the requested rectangle. Place() closes the loop: it
+  places the window, measures where it actually landed with GetWindowRect,
+  adjusts the target by the observed error, and retries - up to four
+  iterations or until the measured rectangle matches the target exactly.
 
   SNAP INTERFERENCE GUARD
-  Windows 11's snap machinery (and some apps) can also re-adjust a window
-  asynchronously AFTER SetWindowPos reports success. Restore therefore
-  verifies every placed non-maximized window ~350 ms later and re-places
-  any that moved, up to three rounds.
+  Windows 11's snap machinery (and some apps) can re-adjust a window
+  asynchronously AFTER SetWindowPos reports success. Restore verifies every
+  placed non-maximized window ~350 ms later and re-places any that moved,
+  up to three rounds.
 
   DPI AWARENESS
   The script declares per-monitor-DPI-aware (v2) both at the process level
   (best effort) and at the THREAD level around every coordinate-sensitive
-  operation (Capture, Place, and the convergence measurements inside
-  Place), so all coordinates are TRUE PHYSICAL PIXELS on every
-  Windows 10 1607+ system - including when the hosting console has already
-  locked the process-level context.
-  IMPORTANT: after upgrading from an older version, RE-SAVE your layout once
-  before restoring; layouts saved by older versions may contain rounded
-  (virtualized) coordinates.
+  operation (Capture and Place), so all coordinates are TRUE PHYSICAL
+  PIXELS on every Windows 10 1607+ system - including when the hosting
+  console has already locked the process-level context.
+  IMPORTANT: layouts saved by versions older than 1.5 may contain rounded
+  (virtualized) coordinates; re-save once with a current version.
 
 .USAGE
   Save layout:
@@ -59,27 +79,35 @@
   Ctrl+Alt+R) in each shortcut's Properties for one-keystroke save/restore.
 
 .CHANGELOG
-  1.7  Fixed: deterministic few-pixel offset on restore, unaffected by
-       disabling Windows snap and identical on repeated restores. Cause:
-       on mixed-DPI systems, coordinate conversion between per-monitor
-       spaces (for windows whose DPI awareness differs from the monitor
-       scaling) rounds coordinates in both directions, so a single
-       SetWindowPos lands the same few pixels off every time. Fix: Place()
-       now converges - place, measure with GetWindowRect, adjust the target
-       by the observed error, retry (max 4 iterations, stop when exact).
+  1.8  Fixed (1): windows snapped flush to the LEFT or RIGHT edge of a
+       display were dragged ~8 pixels inward on every restore, while
+       windows not touching an edge restored pixel-exactly. Root cause:
+       edge-flush windows carry an invisible resize border (~7-8 px) that
+       makes their outer rectangle extend past the monitor edge by design;
+       the virtual desktop clamp in Place() treated this as off-screen and
+       pulled the windows inward. Fix: the clamp now tolerates a
+       16-physical-pixel overhang per side.
+  1.8  Fixed (2): Edge and Teams windows (and other apps whose title
+       reflects the active tab/conversation) did not restore consistently,
+       because matching relied on the window title. Restore now matches
+       through a cascade - title+process+class, then process+class
+       (title went stale), then title+process (legacy layouts). The window
+       class name is now saved in the layout file. Layout files created by
+       earlier versions still restore (cascade 3), but re-saving improves
+       matching for tabbed apps.
+  1.7  Added: convergence loop in Place() - place, measure with
+       GetWindowRect, correct the target by the observed error, retry
+       (max 4 iterations), covering deterministic rounding drift on
+       mixed-DPI systems.
   1.6  Added: post-placement verification. Windows 11's snap machinery and
        some apps re-adjust windows asynchronously after SetWindowPos reports
        success; Restore re-measures placed windows ~350 ms later and
        re-asserts any that moved (up to three rounds), reporting the count.
   1.5  Fixed: restore landing windows a few pixels off from the saved
-       position. Cause: when the process-level per-monitor DPI declaration
-       fails (common, because the hosting console usually locks the context
-       first), the script fell back to system-DPI-aware mode and all
-       GetWindowRect/SetWindowPos calls went through DPI virtualization with
-       its rounding on both directions. Fix: the Capture and Place methods
-       now switch the CALLING THREAD to per-monitor-v2 DPI awareness via
-       SetThreadDpiAwarenessContext (Windows 10 1607+) for the duration of
-       the call and restore the previous context afterwards.
+       position when the process-level per-monitor DPI declaration fails.
+       The Capture and Place methods now switch the CALLING THREAD to
+       per-monitor-v2 DPI awareness via SetThreadDpiAwarenessContext
+       (Windows 10 1607+) for the duration of the call.
   1.4  Fixed: restore reported "Restored 0 of N" with System.Object[] names
        under Windows PowerShell 5.1 (ConvertFrom-Json top-level array
        emitted as a single object). Fix: parsed result is unwrapped
@@ -101,6 +129,9 @@
      may fight back and reposition themselves. The verification pass
      re-asserts the saved position, but a badly behaved app can win a
      tug-of-war over the long run.
+   - Several windows of the SAME app with changed titles are matched in
+     saved/enumeration order; the assignment between them may be swapped
+     (both still receive a saved rectangle).
    - Minimized windows are not saved (Windows hides their real position).
    - Requires PowerShell run at the same integrity level as the target windows
      (a normal, non-elevated session handles your normal windows fine).
@@ -136,6 +167,7 @@ namespace WinLayout
         public IntPtr Handle;
         public int    Pid;
         public string Title;
+        public string ClassName;               // stable across sessions; used for matching
         public bool   Zoomed;                  // currently maximized?
         public int    Left, Top, Right, Bottom;
     }
@@ -251,6 +283,16 @@ namespace WinLayout
         private const uint SWP_NOACTIVATE    = 0x0010;
         private const int  SW_MAXIMIZE      = 3;
 
+        // Tolerance for the virtual-desktop clamp, in physical pixels.
+        // Every Windows 10/11 window has an invisible resize border of about
+        // 7-8 physical pixels that GetWindowRect includes. A window snapped
+        // flush to a screen edge therefore has an outer rectangle that
+        // legitimately extends PAST the monitor edge by the border width.
+        // Clamping must tolerate that overhang, otherwise edge-flush windows
+        // get dragged ~8 px inward on every restore. 16 px per side is above
+        // any realistic border width yet far below a genuine misplacement.
+        private const int CLAMP_TOLERANCE_PX = 16;
+
         // Window classes that belong to the shell / desktop, not real apps.
         private static readonly HashSet<string> ExcludedClasses =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase)
@@ -278,7 +320,8 @@ namespace WinLayout
             // Skip the desktop / shell windows so they never enter the layout.
             var cls = new StringBuilder(256);
             GetClassName(h, cls, cls.Capacity);
-            if (ExcludedClasses.Contains(cls.ToString())) return true;
+            string className = cls.ToString();
+            if (ExcludedClasses.Contains(className)) return true;
 
             var sb = new StringBuilder(GetWindowTextLength(h) + 1);
             GetWindowText(h, sb, sb.Capacity);
@@ -290,11 +333,12 @@ namespace WinLayout
             GetWindowRect(h, out r);
 
             _windows.Add(new WinInfo {
-                Handle = h,
-                Pid    = (int)pid,
-                Title  = sb.ToString(),
-                Zoomed  = IsZoomed(h),
-                Left   = r.L, Top = r.T, Right = r.R, Bottom = r.B
+                Handle    = h,
+                Pid       = (int)pid,
+                Title     = sb.ToString(),
+                ClassName = className,
+                Zoomed    = IsZoomed(h),
+                Left      = r.L, Top = r.T, Right = r.R, Bottom = r.B
             });
             return true;
         }
@@ -320,13 +364,18 @@ namespace WinLayout
         // Move a window to the given rectangle, clamped to the visible virtual
         // desktop so a saved position never ends up off-screen.
         //
-        // CONVERGENCE LOOP: on mixed-DPI systems the coordinate conversion
-        // between per-monitor spaces (for windows whose DPI awareness differs
-        // from the monitor scaling) rounds coordinates in both directions, so
-        // a single SetWindowPos can land the same few pixels off every time.
-        // We therefore place, measure the actual result with GetWindowRect,
-        // adjust the target by the observed error and retry - up to four
-        // iterations, stopping as soon as the measured rectangle matches.
+        // IMPORTANT: the clamp tolerates a small overhang (CLAMP_TOLERANCE_PX
+        // per side). Windows snapped flush to a monitor edge have an outer
+        // rectangle that extends past the monitor edge by the width of the
+        // invisible resize border - that is normal geometry, not a lost
+        // window. Clamping at the exact edge would drag such windows inward
+        // on every restore while leaving non-edge windows untouched.
+        //
+        // A convergence loop then closes the remaining gap: place, measure
+        // the actual result with GetWindowRect, adjust the target by the
+        // observed error and retry - up to four iterations, stopping as soon
+        // as the measured rectangle matches (covers deterministic rounding
+        // drift on mixed-DPI systems).
         public static bool Place(IntPtr h, int left, int top, int right, int bottom)
         {
             IntPtr oldCtx = EnterThreadDpiAwareness();
@@ -337,14 +386,38 @@ namespace WinLayout
                 int vsW = GetSystemMetrics(78);   // SM_CXVIRTUALSCREEN
                 int vsH = GetSystemMetrics(79);   // SM_CYVIRTUALSCREEN
 
-                if (right - left > vsW) { right  = left + vsW; }
-                if (bottom - top > vsH) { bottom = top + vsH; }
-                if (left < vsX)       { right  += vsX - left;  left  = vsX; }
-                if (top  < vsY)       { bottom += vsY - top;   top   = vsY; }
-                if (right > vsX + vsW) { left   -= right - (vsX + vsW); right  = vsX + vsW; }
-                if (bottom > vsY + vsH){ top    -= bottom - (vsY + vsH); bottom = vsY + vsH; }
+                // Only pull a window back when it is MORE than the tolerance
+                // outside the virtual desktop on any side.
+                if (right - left > vsW + 2 * CLAMP_TOLERANCE_PX)
+                {
+                    right = left + vsW + 2 * CLAMP_TOLERANCE_PX;
+                }
+                if (bottom - top > vsH + 2 * CLAMP_TOLERANCE_PX)
+                {
+                    bottom = top + vsH + 2 * CLAMP_TOLERANCE_PX;
+                }
+                if (left < vsX - CLAMP_TOLERANCE_PX)
+                {
+                    right  += (vsX - CLAMP_TOLERANCE_PX) - left;
+                    left    = vsX - CLAMP_TOLERANCE_PX;
+                }
+                if (top < vsY - CLAMP_TOLERANCE_PX)
+                {
+                    bottom += (vsY - CLAMP_TOLERANCE_PX) - top;
+                    top     = vsY - CLAMP_TOLERANCE_PX;
+                }
+                if (right > vsX + vsW + CLAMP_TOLERANCE_PX)
+                {
+                    left  -= right - (vsX + vsW + CLAMP_TOLERANCE_PX);
+                    right  = vsX + vsW + CLAMP_TOLERANCE_PX;
+                }
+                if (bottom > vsY + vsH + CLAMP_TOLERANCE_PX)
+                {
+                    top   -= bottom - (vsY + vsH + CLAMP_TOLERANCE_PX);
+                    bottom = vsY + vsH + CLAMP_TOLERANCE_PX;
+                }
 
-                // Retry loop: place, measure, correct, repeat.
+                // Convergence loop: place, measure, correct, repeat.
                 for (int attempt = 0; attempt < 4; attempt++)
                 {
                     if (!SetWindowPos(h, IntPtr.Zero, left, top,
@@ -415,6 +488,7 @@ switch ($Action) {
             [pscustomobject]@{
                 Process  = $procName[$w.Pid]
                 Title    = $w.Title
+                Class    = $w.ClassName
                 Left     = $w.Left
                 Top      = $w.Top
                 Width    = $w.Right  - $w.Left
@@ -465,17 +539,35 @@ switch ($Action) {
 
             if ([string]::IsNullOrWhiteSpace($s.Title)) { continue }
 
-            # Match on exact title; verify the process name agrees so we do not
-            # grab an unrelated window that happens to share a title.
-            $candidates = $current | Where-Object {
-                $_.Title -eq $s.Title -and
+            # Pool of unconsumed live windows owned by the same process.
+            $pool = $current | Where-Object {
+                ($usedHandles -notcontains $_.Handle) -and
                 $procName.ContainsKey($_.Pid) -and
                 $procName[$_.Pid] -eq $s.Process
             }
 
-            $match = $candidates |
-                Where-Object { $usedHandles -notcontains $_.Handle } |
-                Select-Object -First 1
+            # MATCHING CASCADE
+            # 1. Title + process + class: precise match for titles that have
+            #    not changed since the save.
+            # 2. Process + class: rescues windows whose title went stale
+            #    (Edge: active tab; Teams: active conversation), matched in
+            #    saved/enumeration order among that app's remaining windows.
+            # 3. Title + process: legacy layouts saved before the window
+            #    class was recorded in the layout file.
+            $match = $null
+            if ($s.PSObject.Properties['Class'] -and -not [string]::IsNullOrWhiteSpace($s.Class)) {
+                $match = $pool | Where-Object {
+                    $_.Title -eq $s.Title -and $_.Class -eq $s.Class
+                } | Select-Object -First 1
+                if (-not $match) {
+                    $match = $pool | Where-Object { $_.Class -eq $s.Class } |
+                        Select-Object -First 1
+                }
+            }
+            else {
+                $match = $pool | Where-Object { $_.Title -eq $s.Title } |
+                    Select-Object -First 1
+            }
 
             if (-not $match) {
                 $missed.Add(('{0} - "{1}"' -f $s.Process, $s.Title))
